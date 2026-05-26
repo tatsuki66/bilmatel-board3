@@ -2477,20 +2477,28 @@ let expandedThemes = new Set();
 
 async function loadState() {
   try {
-    const res = await fetch(GAS_URL + '?action=get', { mode: 'cors' });
+    // ★ 修正: タイムアウト処理を追加（GASが応答しない場合の永久ハング防止）
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 20000); // 20秒でタイムアウト
+    let res;
+    try {
+      res = await fetch(GAS_URL + '?action=get', { mode: 'cors', signal: controller.signal });
+    } finally {
+      clearTimeout(timeoutId);
+    }
     const json = await res.json();
     if (json.ok && json.value) {
       state = JSON.parse(json.value);
       return;
     }
   } catch (e) {
-    console.warn('GAS load失敗、ローカルフォールバック:', e);
-    // フォールバック: window.storage
-    try {
-      const result = await window.storage.get(STORAGE_KEY, SHARED);
-      if (result && result.value) { state = JSON.parse(result.value); return; }
-    } catch (e2) {}
+    if (e.name === 'AbortError') {
+      console.warn('GAS load タイムアウト、サンプルデータを使用します');
+    } else {
+      console.warn('GAS load失敗、サンプルデータを使用します:', e);
+    }
   }
+  // フォールバック: サンプルデータ（window.storageはClaudeアーティファクト外では使えないため省略）
   state = createSampleData();
   await saveState();
 }
@@ -4056,6 +4064,16 @@ async function confirmCompleteMeeting() {
       a.carryoverCount = (a.carryoverCount || 0) + 1;
     }
   });
+  // ★ 修正: 新しい定例を自動作成してcurrentMeetingIdを切り替える
+  const newId = 'mtg_' + Date.now();
+  state.meetings[newId] = {
+    id: newId,
+    date: getNextMeetingDate(),
+    title: '次回定例',
+    status: 'preparing',
+    signals: {}, freeNumberComment: '', pillarUpdates: {}, topics: [], signalDiscussions: {}
+  };
+  state.currentMeetingId = newId;
   await saveState();
   closeModal();
   renderAll();
@@ -5494,12 +5512,17 @@ function formatSyncTime() {
 }
 
 // ① 軽量ping: タイムスタンプだけ取得して変更を検知
+// ★ 修正: GAS側にpingアクションがない場合はfetchFullDataにフォールバック
 async function pingSync() {
   if (isSyncing) return;
   try {
     const res = await fetch(GAS_URL + '?action=ping', { mode: 'cors' });
     const result = await res.json();
-    if (!result.ok) return;
+    if (!result.ok) {
+      // GASがpingアクション未対応の場合はフルデータ取得にフォールバック
+      await fetchFullData();
+      return;
+    }
     const ts = result.timestamp;
     if (ts && ts !== lastKnownTimestamp) {
       // タイムスタンプが変わった → フルデータを取得
@@ -5510,20 +5533,32 @@ async function pingSync() {
       setSyncStatus('', '最終確認: ' + formatSyncTime());
     }
   } catch (e) {
-    // pingエラーは静かに無視（ネットワーク切断など）
-    setSyncStatus('error', '接続確認中...');
+    // pingエラーの場合もフルデータ取得を試みる（GASがpingアクション未対応など）
+    try {
+      await fetchFullData();
+    } catch(e2) {
+      setSyncStatus('error', '接続エラー — 手動更新してください');
+    }
   }
 }
 
 // ② フルデータ取得（変更検知時のみ呼ばれる）
+// ★ 修正: タイムアウト処理を追加して永久ハングを防止
 async function fetchFullData() {
   if (isSyncing) return;
   isSyncing = true;
   setSyncStatus('syncing', '更新を取得中...');
   try {
-    const res = await fetch(GAS_URL + '?action=get', { mode: 'cors' });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15秒でタイムアウト
+    let res;
+    try {
+      res = await fetch(GAS_URL + '?action=get', { mode: 'cors', signal: controller.signal });
+    } finally {
+      clearTimeout(timeoutId);
+    }
     const result = await res.json();
-    if (!result.ok || !result.value) { isSyncing = false; return; }
+    if (!result.ok || !result.value) { isSyncing = false; setSyncStatus('error', '取得失敗 — データ形式エラー'); return; }
     const freshJson = result.value;
     if (freshJson === lastSyncedJson) {
       setSyncStatus('', '最終同期: ' + formatSyncTime());
@@ -5541,7 +5576,11 @@ async function fetchFullData() {
       setTimeout(() => setSyncStatus('', '最終同期: ' + formatSyncTime()), 3000);
     }
   } catch (e) {
-    setSyncStatus('error', '取得エラー');
+    if (e.name === 'AbortError') {
+      setSyncStatus('error', '接続タイムアウト — 手動更新してください');
+    } else {
+      setSyncStatus('error', '取得エラー');
+    }
   }
   isSyncing = false;
 }
@@ -5569,17 +5608,13 @@ function startPolling() {
   lastSyncedJson = JSON.stringify(state);
 }
 
-// saveState をラップ: 自分の保存はdiffから除外 + タイムスタンプを記録
+// ★ 修正: saveState後は自分の変更としてマーク。saveState内でpingを呼ばない（fetch連鎖によるハング防止）
 const _origSaveState = saveState;
 saveState = async function() {
   await _origSaveState();
   lastSyncedJson = JSON.stringify(state);
-  // 保存後にpingしてタイムスタンプを同期
-  try {
-    const res = await fetch(GAS_URL + '?action=ping', { mode: 'cors' });
-    const result = await res.json();
-    if (result.ok && result.timestamp) lastKnownTimestamp = result.timestamp;
-  } catch(e) {}
+  // 自分が保存した直後はタイムスタンプをリセットして次のpollサイクルで正しく取得させる
+  lastKnownTimestamp = null;
   setSyncStatus('', '最終同期: ' + formatSyncTime());
 };
 
